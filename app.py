@@ -158,29 +158,32 @@ def parse_month(question):
     return None
 
 
+
+
 def answer_question(question, orders, rates):
     q = question.lower().strip()
-
-    # Paid orders are the only orders included in revenue.
-    paid = paid_orders(orders)
     month = parse_month(q)
 
-    # Optional date filtering uses the order creation date.
+    # Apply date, region, product, and customer filters to ALL orders.
+    filtered = list(orders)
+
     if month:
-        paid = [
-            o for o in paid
+        filtered = [
+            o for o in filtered
             if str(o.get("created_at", "")).startswith(month)
         ]
 
-    # Region/product/customer/status filters.
     regions = sorted({
-        str(o.get("region", "")) for o in orders if o.get("region")
+        str(o.get("region", ""))
+        for o in orders if o.get("region")
     })
     products = sorted({
-        str(o.get("product", "")) for o in orders if o.get("product")
+        str(o.get("product", ""))
+        for o in orders if o.get("product")
     })
     customers = sorted({
-        str(o.get("customer", "")) for o in orders if o.get("customer")
+        str(o.get("customer", ""))
+        for o in orders if o.get("customer")
     })
 
     selected_region = next(
@@ -193,60 +196,120 @@ def answer_question(question, orders, rates):
         (c for c in customers if c.lower() in q), None
     )
 
-    filtered = paid
     if selected_region:
         filtered = [
             o for o in filtered
-            if str(o.get("region", "")).lower() == selected_region.lower()
+            if str(o.get("region", "")).lower()
+            == selected_region.lower()
         ]
+
     if selected_product:
         filtered = [
             o for o in filtered
-            if str(o.get("product", "")).lower() == selected_product.lower()
+            if str(o.get("product", "")).lower()
+            == selected_product.lower()
         ]
+
     if selected_customer:
         filtered = [
             o for o in filtered
-            if str(o.get("customer", "")).lower() == selected_customer.lower()
+            if str(o.get("customer", "")).lower()
+            == selected_customer.lower()
         ]
 
-    # Order counts.
+    # Detect requested status, including refunded orders.
+    status_aliases = {
+        "paid": ("paid",),
+        "pending": ("pending",),
+        "cancelled": ("cancelled", "canceled"),
+        "void": ("void",),
+        "refunded": ("refunded", "refund"),
+    }
+
+    selected_status = None
+    for status, aliases in status_aliases.items():
+        if any(re.search(r"\b" + re.escape(a) + r"\b", q)
+               for a in aliases):
+            selected_status = status
+            break
+
+    if selected_status:
+        accepted_statuses = status_aliases[selected_status]
+        filtered = [
+            o for o in filtered
+            if str(o.get("status", "")).lower()
+            in accepted_statuses
+        ]
+
+    # For revenue, only paid orders count.
+    paid = paid_orders(orders)
+    paid_filtered = [
+        o for o in filtered
+        if str(o.get("status", "")).lower() == "paid"
+    ]
+
+    # Specific order lookup.
+    order_id = re.search(r"\bORD-\d+\b", question, re.I)
+    if order_id:
+        found = [
+            o for o in orders
+            if str(o.get("id", "")).upper()
+            == order_id.group(0).upper()
+        ]
+        return {"answer": found[0] if found else None}
+
+    # Distinct customer count must respect all requested filters.
     if any(word in q for word in ("how many", "count", "number of")):
-        if "customer" in q and not selected_customer:
-            return {"answer": len(customers)}
+        if "customer" in q:
+            matching_customers = {
+                o.get("customer")
+                for o in filtered
+                if o.get("customer")
+            }
+            return {"answer": len(matching_customers)}
 
-        if "paid" in q:
-            return {"answer": len(paid)}
-
-        if "order" in q:
-            return {"answer": len(orders)}
+        if "product" in q and any(
+            word in q for word in ("different", "distinct", "unique")
+        ):
+            matching_products = {
+                o.get("product")
+                for o in filtered
+                if o.get("product")
+            }
+            return {"answer": len(matching_products)}
 
         return {"answer": len(filtered)}
 
-    # Revenue / sales.
-    if any(word in q for word in ("revenue", "sales", "turnover", "earned")):
-        total = sum(amount_usd(o, rates) for o in filtered)
+    # Revenue and sales questions.
+    if any(word in q for word in (
+        "revenue", "sales", "turnover", "earned"
+    )):
+        total = sum(amount_usd(o, rates) for o in paid_filtered)
         return {"answer": round(total, 2), "currency": "USD"}
 
     # Average order value.
     if "average" in q or "avg" in q:
-        if not filtered:
+        if not paid_filtered:
             return {"answer": 0, "currency": "USD"}
-        total = sum(amount_usd(o, rates) for o in filtered)
+
+        total = sum(amount_usd(o, rates) for o in paid_filtered)
         return {
-            "answer": round(total / len(filtered), 2),
+            "answer": round(total / len(paid_filtered), 2),
             "currency": "USD",
         }
 
-    # Product ranking.
+    # Top products by quantity.
     if "product" in q and any(
         word in q for word in ("top", "most", "best", "popular")
     ):
         totals = {}
-        for o in paid:
+        for o in paid_filtered:
             name = o.get("product", "Unknown")
             totals[name] = totals.get(name, 0) + int(o.get("qty", 0))
-        ranked = sorted(totals.items(), key=lambda item: item[1], reverse=True)
+
+        ranked = sorted(
+            totals.items(), key=lambda item: item[1], reverse=True
+        )
         return {
             "answer": [
                 {"product": name, "quantity": quantity}
@@ -254,15 +317,20 @@ def answer_question(question, orders, rates):
             ]
         }
 
-    # Regional ranking.
+    # Regional revenue ranking.
     if "region" in q and any(
         word in q for word in ("top", "most", "best", "highest")
     ):
         totals = {}
         for o in paid:
             region = o.get("region", "Unknown")
-            totals[region] = totals.get(region, 0) + amount_usd(o, rates)
-        ranked = sorted(totals.items(), key=lambda item: item[1], reverse=True)
+            totals[region] = (
+                totals.get(region, 0) + amount_usd(o, rates)
+            )
+
+        ranked = sorted(
+            totals.items(), key=lambda item: item[1], reverse=True
+        )
         return {
             "answer": [
                 {"region": name, "revenue_usd": round(value, 2)}
@@ -270,29 +338,17 @@ def answer_question(question, orders, rates):
             ]
         }
 
-    # List orders by status or return a matching order.
-    order_id = re.search(r"\bORD-\d+\b", question, re.I)
-    if order_id:
-        found = [
-            o for o in orders
-            if str(o.get("id", "")).upper() == order_id.group(0).upper()
-        ]
-        return {"answer": found[0] if found else None}
-
-    status = next(
-        (s for s in ("paid", "pending", "cancelled", "void")
-         if re.search(r"\b" + s + r"\b", q)),
-        None,
-    )
-    if status:
-        matching = [
-            o for o in orders
-            if str(o.get("status", "")).lower() == status
-        ]
-        return {"answer": len(matching), "status": status}
+    # Status count, including refunded.
+    if selected_status:
+        return {
+            "answer": len(filtered),
+            "status": selected_status,
+        }
 
     # General summary.
-    if any(word in q for word in ("summary", "overview", "total orders")):
+    if any(word in q for word in (
+    "summary", "overview", "total orders"
+    )):
         revenue = sum(amount_usd(o, rates) for o in paid)
         return {
             "total_orders": len(orders),
@@ -305,14 +361,13 @@ def answer_question(question, orders, rates):
     return {
         "error": "I could not interpret that question.",
         "supported_queries": [
+            "Number of orders by status, region, product, or month",
+            "Number of distinct customers matching filters",
             "Total paid revenue in USD",
-            "Number of orders",
             "Average order value",
-            "Revenue by region",
             "Top products by quantity",
-            "Orders by status",
+            "Revenue by region",
             "Details for an order ID",
-            "Monthly revenue, e.g. revenue in March 2026",
         ],
     }
 
