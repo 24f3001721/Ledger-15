@@ -24,6 +24,7 @@ _cache_lock = threading.Lock()
 
 
 
+
 def fetch_url(url, params=None):
     response = requests.get(url, params=params, timeout=8)
     response.raise_for_status()
@@ -36,10 +37,12 @@ def get_api_index():
     return fetch_url(API_BASE)
 
 
-def fetch_data(path, page=None):
-    index = get_api_index()
-    url = index.get("links", {}).get(path)
+def fetch_data(path, page=None, index=None):
+    # Reuse the API index when one is supplied.
+    if index is None:
+        index = get_api_index()
 
+    url = index.get("links", {}).get(path)
     if not url:
         raise ValueError(f"API index has no link for {path}")
 
@@ -47,51 +50,58 @@ def fetch_data(path, page=None):
     return fetch_url(url, params=params)
 
 
-def fetch_page(page):
-    return fetch_data("orders", page)
+def fetch_page(page, index=None):
+    return fetch_data("orders", page, index=index)
 
 
 def load_ledger():
-    """Download pages concurrently, deduplicate orders and load rates."""
+    """Download ledger pages, deduplicate orders, and cache currency rates."""
     with _cache_lock:
         now = time.time()
+
         if (
             _cache["orders"] is not None
             and now - _cache["loaded_at"] < CACHE_SECONDS
         ):
             return _cache["orders"], _cache["rates"]
 
-        first = fetch_page(1)
+        # Fetch the API index only once for this load.
+        index = get_api_index()
+
+        first = fetch_page(1, index=index)
         total_pages = int(first.get("pages", 1))
         all_orders = list(first.get("orders", []))
 
         if total_pages > 1:
-            with ThreadPoolExecutor(max_workers=20) as executor:
+            with ThreadPoolExecutor(max_workers=5) as executor:
                 futures = [
-                    executor.submit(fetch_page, page)
+                    executor.submit(fetch_page, page, index)
                     for page in range(2, total_pages + 1)
                 ]
+
                 for future in as_completed(futures):
                     data = future.result()
                     all_orders.extend(data.get("orders", []))
 
-        # Keep the most recently updated version of each order.
+        # Keep the latest updated version of each order.
         latest = {}
+
         for order in all_orders:
             order_id = order.get("id")
             if not order_id:
                 continue
 
             previous = latest.get(order_id)
+
             if previous is None or str(order.get("updated_at", "")) > str(
                 previous.get("updated_at", "")
             ):
                 latest[order_id] = order
 
-        rates_data = fetch_data("rates")
+        rates_data = fetch_data("rates", index=index)
         rates = rates_data["usd_per_unit"]
-
         orders = list(latest.values())
+
         _cache.update({
             "loaded_at": time.time(),
             "orders": orders,
@@ -100,13 +110,11 @@ def load_ledger():
 
         app.logger.info(
             "Loaded %s records; %s unique orders",
-            len(all_orders), len(orders)
+            len(all_orders),
+            len(orders),
         )
-        app.logger.info("Sample order: %s", orders[0] if orders else "NO ORDERS")
-        app.logger.info("Currency rates: %s", rates)
         return orders, rates
-
-
+    
 def amount_usd(order, rates):
     currency = str(order.get("currency", "USD")).upper()
     rate = rates.get(currency)
